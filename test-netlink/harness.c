@@ -18,7 +18,16 @@
 
 static void _log(struct mLogger* logger, int category, enum mLogLevel level, const char* format, va_list args) {
 	(void) logger;
-	if (!(level & (mLOG_WARN | mLOG_ERROR | mLOG_FATAL | mLOG_INFO)) || category == -1) {
+	if (category == -1) {
+		return;
+	}
+	if (getenv("DEBUG_SIO") && !strcmp(mLogCategoryName(category), "GBA Serial I/O") && (level & mLOG_DEBUG)) {
+		fprintf(stderr, "  dbg: ");
+		vfprintf(stderr, format, args);
+		fprintf(stderr, "\n");
+		return;
+	}
+	if (!(level & (mLOG_WARN | mLOG_ERROR | mLOG_FATAL | mLOG_INFO))) {
 		return;
 	}
 	if (level == mLOG_INFO && strcmp(mLogCategoryName(category), "GBA Serial I/O")) {

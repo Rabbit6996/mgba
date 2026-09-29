@@ -553,7 +553,7 @@ if(ENABLE_GDB_STUB)
 endif()
 
 # Note: embedded ports (3DS etc.) build with MINIMAL_CORE, so don't key off it
-if(NOT M_CORE_GBA OR LIBRETRO)
+if(NOT M_CORE_GBA OR LIBRETRO OR DISABLE_THREADING)
 	set(ENABLE_NETLINK OFF)
 endif()
 if(ENABLE_NETLINK)

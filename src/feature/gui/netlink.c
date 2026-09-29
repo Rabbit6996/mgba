@@ -15,6 +15,9 @@
 #include <mgba-util/gui/font.h>
 #include <mgba-util/gui/menu.h>
 #include <mgba-util/socket.h>
+#include <mgba-util/vfs.h>
+
+#include <stdarg.h>
 
 #ifndef _MSC_VER
 #include <sys/time.h>
@@ -48,6 +51,12 @@ struct mGUINetLink {
 	char notice[96];
 	char status[96];
 	int64_t cancelHeldSince;
+
+	// Diagnostic log on the SD card: <config dir>/netlink.log
+	struct VFile* log;
+	int64_t logStart;
+	bool waiting;
+	unsigned frames;
 };
 
 static int64_t _now(void) {
@@ -60,6 +69,42 @@ static int64_t _now(void) {
 	timespec_get(&ts, TIME_UTC);
 	return ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
 #endif
+}
+
+static void _logf(struct mGUINetLink* netlink, const char* format, ...) {
+	if (!netlink->log) {
+		char path[PATH_MAX];
+		mCoreConfigDirectory(path, sizeof(path));
+		strncat(path, PATH_SEP "netlink.log", sizeof(path) - strlen(path) - 1);
+		netlink->log = VFileOpen(path, O_CREAT | O_WRONLY | O_APPEND);
+		if (!netlink->log) {
+			return;
+		}
+		netlink->logStart = _now();
+		const char* header = "---- mGBA Wi-Fi link session ----\n";
+		netlink->log->write(netlink->log, header, strlen(header));
+	}
+	char line[256];
+	int64_t t = _now() - netlink->logStart;
+	int length = snprintf(line, sizeof(line), "[%4u.%03us] ", (unsigned) (t / 1000000), (unsigned) (t / 1000 % 1000));
+	va_list args;
+	va_start(args, format);
+	length += vsnprintf(&line[length], sizeof(line) - length - 1, format, args);
+	va_end(args);
+	if (length > (int) sizeof(line) - 2) {
+		length = sizeof(line) - 2;
+	}
+	line[length++] = '\n';
+	netlink->log->write(netlink->log, line, length);
+	netlink->log->sync(netlink->log, NULL, 0);
+}
+
+static void _logStats(struct mGUINetLink* netlink, const char* what) {
+	const struct GBASIONetLink* link = &netlink->link;
+	_logf(netlink, "%s: state=%i player=%i mode=%i peerMode=%i peerPaused=%i transfers=%u replyWaits=%u driftWaits=%u missed=%u waited=%.2fs",
+	      what, link->state, link->playerId + 1, link->localMode, link->peerMode, link->peerPaused,
+	      link->stats.transfers, link->stats.replyWaits, link->stats.driftWaits, link->stats.missedReplies,
+	      link->stats.waitMicros / 1e6);
 }
 
 static bool _isGBA(struct mGUIRunner* runner) {
@@ -149,6 +194,10 @@ static bool _waitCallback(struct GBASIONetLink* link, void* context, enum GBASIO
 	UNUSED(link);
 	struct mGUIRunner* runner = context;
 	struct mGUINetLink* netlink = _get(runner);
+	if (!netlink->waiting) {
+		netlink->waiting = true;
+		_logStats(netlink, reason == GBA_NETLINK_WAIT_PARTNER_PAUSED ? "waiting (partner paused)" : "waiting (partner slow)");
+	}
 	if (!_stillRunning(runner)) {
 		return false;
 	}
@@ -162,6 +211,7 @@ static bool _waitCallback(struct GBASIONetLink* link, void* context, enum GBASIO
 		netlink->cancelHeldSince = now;
 	} else if (now - netlink->cancelHeldSince >= CANCEL_HOLD_US) {
 		netlink->cancelHeldSince = 0;
+		_logf(netlink, "user cancelled the wait after %.1fs", waited / 1e6);
 		return false;
 	}
 
@@ -222,6 +272,9 @@ static void _detach(struct mGUIRunner* runner, struct mGUINetLink* netlink) {
 }
 
 static void _disconnect(struct mGUIRunner* runner, struct mGUINetLink* netlink) {
+	if (GBASIONetLinkGetState(&netlink->link) != GBA_NETLINK_IDLE) {
+		_logStats(netlink, "disconnecting");
+	}
 	GBASIONetLinkDisconnect(&netlink->link);
 	netlink->lastState = GBA_NETLINK_IDLE;
 	_detach(runner, netlink);
@@ -258,6 +311,7 @@ static bool _waitForPartner(struct mGUIRunner* runner, struct mGUINetLink* netli
 			break;
 		}
 		if (state == GBA_NETLINK_ERROR || state == GBA_NETLINK_IDLE) {
+			_logf(netlink, "connecting failed: %s", GBASIONetLinkGetError(&netlink->link));
 			char error[GBA_NETLINK_ERROR_LENGTH + 32];
 			snprintf(error, sizeof(error), "%s.%s", GBASIONetLinkGetError(&netlink->link),
 			         netlink->link.playerId ? " Is player 1 waiting?" : "");
@@ -268,6 +322,7 @@ static bool _waitForPartner(struct mGUIRunner* runner, struct mGUINetLink* netli
 		uint32_t keys = 0;
 		GUIPollInput(&runner->params, &keys, NULL);
 		if (keys & ((1 << GUI_INPUT_BACK) | (1 << GUI_INPUT_CANCEL))) {
+			_logf(netlink, "user cancelled connecting");
 			_disconnect(runner, netlink);
 			GUIInvalidateKeys(&runner->params);
 			return false;
@@ -276,6 +331,8 @@ static bool _waitForPartner(struct mGUIRunner* runner, struct mGUINetLink* netli
 	}
 
 	netlink->lastState = GBA_NETLINK_CONNECTED;
+	netlink->frames = 0;
+	_logf(netlink, "connected as player %i, my game %s, partner game %s", netlink->link.playerId + 1, netlink->link.localGame, netlink->link.peerGame);
 	char partner[64];
 	snprintf(partner, sizeof(partner), "You are player %i. Partner game: %s", netlink->link.playerId + 1, netlink->link.peerGame);
 	const char* done[] = { partner };
@@ -290,9 +347,11 @@ static bool _waitForPartner(struct mGUIRunner* runner, struct mGUINetLink* netli
 
 static void _host(struct mGUIRunner* runner, struct mGUINetLink* netlink) {
 	uint16_t port = _port(runner);
+	_logf(netlink, "hosting on port %u", port);
 	if (!GBASIONetLinkHost(&netlink->link, port)) {
-		char error[GBA_NETLINK_ERROR_LENGTH + 32];
-		snprintf(error, sizeof(error), "%s. Is player 1 waiting?", GBASIONetLinkGetError(&netlink->link));
+		_logf(netlink, "hosting failed: %s", GBASIONetLinkGetError(&netlink->link));
+		char error[GBA_NETLINK_ERROR_LENGTH + 8];
+		snprintf(error, sizeof(error), "%s.", GBASIONetLinkGetError(&netlink->link));
 		GBASIONetLinkDisconnect(&netlink->link);
 		_showMessage(runner, "Link failed", error);
 		return;
@@ -302,6 +361,7 @@ static void _host(struct mGUIRunner* runner, struct mGUINetLink* netlink) {
 	char address[32];
 	char addressLine[64];
 	if (GBASIONetLinkGetLocalAddress(address, sizeof(address))) {
+		_logf(netlink, "local address %s", address);
 		snprintf(addressLine, sizeof(addressLine), "Your address: %s", address);
 	} else {
 		snprintf(addressLine, sizeof(addressLine), "Could not determine your address. Is Wi-Fi on?");
@@ -345,6 +405,7 @@ static void _join(struct mGUIRunner* runner, struct mGUINetLink* netlink) {
 	char target[64];
 	snprintf(target, sizeof(target), "%.40s, port %u", keyboard.result, port);
 	const char* connecting[] = { target };
+	_logf(netlink, "joining %s", target);
 	_drawScreen(runner, "Connecting...", connecting, NULL, 1);
 	if (!GBASIONetLinkConnect(&netlink->link, keyboard.result, port)) {
 		char error[GBA_NETLINK_ERROR_LENGTH + 32];
@@ -445,8 +506,18 @@ void mGUINetLinkFrame(struct mGUIRunner* runner) {
 	}
 	GBASIONetLinkEnsureScheduled(&netlink->link);
 	enum GBASIONetLinkState state = GBASIONetLinkGetState(&netlink->link);
+	if (netlink->waiting) {
+		netlink->waiting = false;
+		_logStats(netlink, "wait over");
+	}
+	++netlink->frames;
+	if (state == GBA_NETLINK_CONNECTED && (netlink->frames == 60 || netlink->frames % 1800 == 0)) {
+		_logStats(netlink, "running");
+	}
 	if (state != netlink->lastState) {
 		if (netlink->lastState == GBA_NETLINK_CONNECTED && state == GBA_NETLINK_ERROR) {
+			_logf(netlink, "link lost: %s", GBASIONetLinkGetError(&netlink->link));
+			_logStats(netlink, "at loss");
 			char text[GBA_NETLINK_ERROR_LENGTH + 16];
 			snprintf(text, sizeof(text), "Link lost: %s", GBASIONetLinkGetError(&netlink->link));
 			_setNotice(netlink, COLOR_ERROR, text);
@@ -524,6 +595,9 @@ void mGUINetLinkGameUnloading(struct mGUIRunner* runner) {
 	_disconnect(runner, netlink);
 	if (netlink->socketsReady) {
 		SocketSubsystemDeinit();
+	}
+	if (netlink->log) {
+		netlink->log->close(netlink->log);
 	}
 	free(netlink);
 	runner->netlink = NULL;

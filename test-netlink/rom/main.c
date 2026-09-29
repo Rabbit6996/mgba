@@ -151,9 +151,12 @@ int main(void) {
 		}
 	} else {
 		if (role) {
+			// Stay in multiplayer mode long enough for the parent to see us
+			spin(200000);
 			normalChild(PARAMS->count, PARAMS->childDelay);
 		} else {
-			spin(50000);
+			// Let the child leave multiplayer mode and arm its first transfer
+			spin(800000);
 			normalParent(PARAMS->count, PARAMS->gap);
 		}
 	}

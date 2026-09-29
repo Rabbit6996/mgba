@@ -7,6 +7,7 @@
 
 #include <mgba/internal/gba/gba.h>
 #include <mgba/internal/gba/io.h>
+#include <mgba-util/threading.h>
 
 #ifndef _MSC_VER
 #include <sys/time.h>
@@ -116,6 +117,315 @@ static ssize_t _recv(Socket sock, void* buffer, size_t size) {
 #endif
 }
 
+/* ---- Network I/O thread ----
+ *
+ * Every socket call happens here. The emulation thread talks to this thread
+ * through two byte queues guarded by a mutex; it never touches a socket, so
+ * it cannot freeze on one. The context is shared and reference-counted: if a
+ * socket call ever hangs, the emulation side just drops its reference, reports
+ * an error and moves on; the thread cleans up whenever the call returns.
+ */
+
+#define IO_QUEUE_SIZE 0x4000
+#define IO_ACCEPT_POLL_MS 50
+// While data is flowing, check the socket this often and wake up at once for
+// anything to send; when the link is quiet, sleep in poll() for longer.
+#define IO_ACTIVE_WAIT_US 200
+#define IO_IDLE_POLL_MS 4
+#define IO_ACTIVE_WINDOW_US 250000
+
+enum GBASIONetLinkIOStatus {
+	IO_STARTING = 0,
+	IO_CONNECTED,
+	IO_FAILED,
+};
+
+struct GBASIONetLinkIO {
+	Mutex mutex;
+	Condition cond; // signaled when something arrives (for emulation)
+	Condition outCond; // signaled when something is queued to send
+	int refs;
+	bool quit;
+
+	bool host;
+	uint16_t port;
+	uint32_t address;
+
+	enum GBASIONetLinkIOStatus status;
+	char error[GBA_NETLINK_ERROR_LENGTH];
+
+	uint8_t in[IO_QUEUE_SIZE];
+	size_t inFill;
+	uint8_t out[IO_QUEUE_SIZE];
+	size_t outFill;
+	uint8_t pending[IO_QUEUE_SIZE];
+	size_t pendingFill;
+};
+
+static void _condWait(Condition* cond, Mutex* mutex, int timeoutMs) {
+#ifdef __3DS__
+	// mgba-util's 3DS ConditionWaitTimed converts milliseconds incorrectly
+	CondVar_WaitTimeout(cond, mutex, timeoutMs * 1000000LL);
+#else
+	ConditionWaitTimed(cond, mutex, timeoutMs);
+#endif
+}
+
+static void _condWaitMicros(Condition* cond, Mutex* mutex, int timeoutUs) {
+#ifdef __3DS__
+	CondVar_WaitTimeout(cond, mutex, timeoutUs * 1000LL);
+#elif defined(USE_PTHREADS)
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	ts.tv_nsec += timeoutUs * 1000L;
+	ts.tv_sec += ts.tv_nsec / 1000000000L;
+	ts.tv_nsec %= 1000000000L;
+	pthread_cond_timedwait(cond, mutex, &ts);
+#else
+	ConditionWaitTimed(cond, mutex, timeoutUs >= 1000 ? timeoutUs / 1000 : 1);
+#endif
+}
+
+static void _ioRelease(struct GBASIONetLinkIO* io) {
+	MutexLock(&io->mutex);
+	int refs = --io->refs;
+	MutexUnlock(&io->mutex);
+	if (!refs) {
+		MutexDeinit(&io->mutex);
+		ConditionDeinit(&io->cond);
+		ConditionDeinit(&io->outCond);
+		free(io);
+	}
+}
+
+static void _ioSetFailed(struct GBASIONetLinkIO* io, const char* reason, int code) {
+	MutexLock(&io->mutex);
+	if (io->status != IO_FAILED) {
+		io->status = IO_FAILED;
+		if (code) {
+			snprintf(io->error, sizeof(io->error), "%s (code %d)", reason, code);
+		} else {
+			snprintf(io->error, sizeof(io->error), "%s", reason);
+		}
+	}
+	ConditionWake(&io->cond);
+	MutexUnlock(&io->mutex);
+}
+
+static bool _ioShouldQuit(struct GBASIONetLinkIO* io) {
+	MutexLock(&io->mutex);
+	bool quit = io->quit;
+	MutexUnlock(&io->mutex);
+	return quit;
+}
+
+static ssize_t _socketSend(Socket sock, const void* buffer, size_t size) {
+#ifdef NETLINK_USE_POLL
+	int flags = MSG_DONTWAIT;
+#ifdef MSG_NOSIGNAL
+	// A partner that already hung up must not kill the process (SIGPIPE)
+	flags |= MSG_NOSIGNAL;
+#endif
+	return send(sock, buffer, size, flags);
+#else
+	return SocketSend(sock, buffer, size);
+#endif
+}
+
+static Socket _ioOpen(struct GBASIONetLinkIO* io) {
+	if (io->host) {
+		Socket listener = SocketOpenTCP(io->port, NULL);
+		if (SOCKET_FAILED(listener)) {
+			_ioSetFailed(io, "Could not open the link port", SocketError());
+			return INVALID_SOCKET;
+		}
+		if (SOCKET_FAILED(SocketListen(listener, 1))) {
+			int code = SocketError();
+			SocketClose(listener);
+			_ioSetFailed(io, "Could not listen on the link port", code);
+			return INVALID_SOCKET;
+		}
+		SocketSetBlocking(listener, false);
+		Socket sock = INVALID_SOCKET;
+		while (!_ioShouldQuit(io)) {
+			if (!_socketReady(listener, false, IO_ACCEPT_POLL_MS)) {
+				continue;
+			}
+			sock = SocketAccept(listener, NULL);
+			if (!SOCKET_FAILED(sock)) {
+				break;
+			}
+		}
+		SocketClose(listener);
+		return sock;
+	}
+
+	struct Address destination = {
+		.version = IPV4,
+		.ipv4 = io->address,
+	};
+	// A plain blocking connect: we are on our own thread, and non-blocking
+	// connects are unreliable on some systems (e.g. the 3DS)
+	Socket sock = SocketConnectTCP(io->port, &destination);
+	if (SOCKET_FAILED(sock)) {
+		_ioSetFailed(io, "Could not reach the host", SocketError());
+	}
+	return sock;
+}
+
+static THREAD_ENTRY _ioThread(void* context) {
+	struct GBASIONetLinkIO* io = context;
+	Socket sock = _ioOpen(io);
+	if (!SOCKET_FAILED(sock)) {
+		SocketSetBlocking(sock, false);
+		SocketSetTCPPush(sock, 1);
+		MutexLock(&io->mutex);
+		if (io->status == IO_STARTING) {
+			io->status = IO_CONNECTED;
+		}
+		ConditionWake(&io->cond);
+		MutexUnlock(&io->mutex);
+	}
+
+	uint8_t rx[1024];
+	int64_t lastActivity = _nowMicros();
+	while (!SOCKET_FAILED(sock)) {
+		MutexLock(&io->mutex);
+		bool quit = io->quit;
+		if (io->outFill && io->pendingFill < sizeof(io->pending)) {
+			size_t take = sizeof(io->pending) - io->pendingFill;
+			if (take > io->outFill) {
+				take = io->outFill;
+			}
+			memcpy(&io->pending[io->pendingFill], io->out, take);
+			memmove(io->out, &io->out[take], io->outFill - take);
+			io->outFill -= take;
+			io->pendingFill += take;
+		}
+		MutexUnlock(&io->mutex);
+
+		if (io->pendingFill) {
+			lastActivity = _nowMicros();
+			ssize_t sent = _socketSend(sock, io->pending, io->pendingFill);
+			if (sent > 0) {
+				memmove(io->pending, &io->pending[sent], io->pendingFill - sent);
+				io->pendingFill -= sent;
+			} else if (sent < 0 && !SocketWouldBlock()) {
+				_ioSetFailed(io, "Lost connection to partner", SocketError());
+				break;
+			}
+		}
+		if (quit) {
+			// Best effort to get a queued goodbye out; don't wait for anything
+			break;
+		}
+
+		bool active = io->pendingFill || _nowMicros() - lastActivity < IO_ACTIVE_WINDOW_US;
+		if (!_socketReady(sock, false, active ? 0 : IO_IDLE_POLL_MS)) {
+			if (active && !io->pendingFill) {
+				// Nothing to read right now: sleep briefly, but wake up at
+				// once if emulation queues something to send
+				MutexLock(&io->mutex);
+				if (!io->outFill && !io->quit) {
+					_condWaitMicros(&io->outCond, &io->mutex, IO_ACTIVE_WAIT_US);
+				}
+				MutexUnlock(&io->mutex);
+			}
+			continue;
+		}
+		ssize_t received = _recv(sock, rx, sizeof(rx));
+		if (received == 0) {
+			_ioSetFailed(io, "Partner disconnected", 0);
+			break;
+		}
+		if (received < 0) {
+			if (!SocketWouldBlock()) {
+				_ioSetFailed(io, "Lost connection to partner", SocketError());
+				break;
+			}
+			continue;
+		}
+		lastActivity = _nowMicros();
+		MutexLock(&io->mutex);
+		bool overflow = io->inFill + received > sizeof(io->in);
+		if (!overflow) {
+			memcpy(&io->in[io->inFill], rx, received);
+			io->inFill += received;
+			ConditionWake(&io->cond);
+		}
+		MutexUnlock(&io->mutex);
+		if (overflow) {
+			_ioSetFailed(io, "Receive queue overflowed", 0);
+			break;
+		}
+	}
+	if (!SOCKET_FAILED(sock)) {
+		SocketClose(sock);
+	}
+	_ioRelease(io);
+	THREAD_EXIT(0);
+}
+
+static bool _ioStart(struct GBASIONetLink* link, bool host, uint32_t address, uint16_t port) {
+	struct GBASIONetLinkIO* io = calloc(1, sizeof(*io));
+	if (!io) {
+		return false;
+	}
+	MutexInit(&io->mutex);
+	ConditionInit(&io->cond);
+	ConditionInit(&io->outCond);
+	io->refs = 2;
+	io->host = host;
+	io->address = address;
+	io->port = port;
+	io->status = IO_STARTING;
+
+	bool started = false;
+#ifdef __3DS__
+	// Prefer the New 3DS extra core, then the system core, then our own core.
+	// Higher priority than emulation, but it sleeps in poll() nearly always.
+	static const int cores[] = { 2, 1, -2 };
+	size_t i;
+	for (i = 0; i < sizeof(cores) / sizeof(*cores) && !started; ++i) {
+		started = threadCreate(_ioThread, io, 0x4000, 0x18, cores[i], true) != NULL;
+	}
+#else
+	Thread thread;
+	started = !ThreadCreate(&thread, _ioThread, io);
+#ifdef USE_PTHREADS
+	if (started) {
+		pthread_detach(thread);
+	}
+#elif defined(_WIN32)
+	if (started) {
+		CloseHandle(thread);
+	}
+#endif
+#endif
+	if (!started) {
+		MutexDeinit(&io->mutex);
+		ConditionDeinit(&io->cond);
+		ConditionDeinit(&io->outCond);
+		free(io);
+		return false;
+	}
+	link->io = io;
+	return true;
+}
+
+static void _ioStop(struct GBASIONetLink* link) {
+	struct GBASIONetLinkIO* io = link->io;
+	if (!io) {
+		return;
+	}
+	link->io = NULL;
+	MutexLock(&io->mutex);
+	io->quit = true;
+	ConditionWake(&io->outCond);
+	MutexUnlock(&io->mutex);
+	_ioRelease(io);
+}
+
 static uint8_t _encodeMode(int mode) {
 	if (mode < 0 || mode > 0xFE) {
 		return 0xFF;
@@ -142,15 +452,9 @@ static struct GBASIO* _sio(struct GBASIONetLink* link) {
 }
 
 static void _closeSockets(struct GBASIONetLink* link) {
-	if (!SOCKET_FAILED(link->sock)) {
-		SocketClose(link->sock);
-		link->sock = INVALID_SOCKET;
-	}
-	if (!SOCKET_FAILED(link->listener)) {
-		SocketClose(link->listener);
-		link->listener = INVALID_SOCKET;
-	}
+	_ioStop(link);
 	link->rxFill = 0;
+	link->helloSent = false;
 }
 
 static void _executeRemoteTransfer(struct GBASIONetLink* link, const struct GBASIONetLinkMessage* message);
@@ -244,7 +548,8 @@ static void _decode(const uint8_t* buffer, struct GBASIONetLinkMessage* message)
 }
 
 static bool _sendFull(struct GBASIONetLink* link, uint8_t type, uint8_t arg8, uint16_t arg16, uint32_t data, uint32_t extra, uint32_t extra2) {
-	if (SOCKET_FAILED(link->sock)) {
+	struct GBASIONetLinkIO* io = link->io;
+	if (!io) {
 		return false;
 	}
 	struct GBASIONetLinkMessage message = {
@@ -255,29 +560,18 @@ static bool _sendFull(struct GBASIONetLink* link, uint8_t type, uint8_t arg8, ui
 		.extra = extra,
 		.extra2 = extra2,
 	};
-	uint8_t buffer[GBA_NETLINK_MESSAGE_SIZE];
-	_encode(&message, buffer);
-
-	size_t sent = 0;
-	int64_t start = _nowMicros();
-	while (sent < sizeof(buffer)) {
-		ssize_t result = SocketSend(link->sock, &buffer[sent], sizeof(buffer) - sent);
-		if (result > 0) {
-			sent += result;
-			continue;
-		}
-		if (result < 0 && SocketWouldBlock()) {
-			if (_nowMicros() - start > link->timeoutMs * 1000LL) {
-				_fail(link, "Sending to partner timed out");
-				return false;
-			}
-			_socketReady(link->sock, true, 20);
-			continue;
-		}
-		_fail(link, "Lost connection to partner");
-		return false;
+	MutexLock(&io->mutex);
+	bool queued = io->outFill + GBA_NETLINK_MESSAGE_SIZE <= sizeof(io->out);
+	if (queued) {
+		_encode(&message, &io->out[io->outFill]);
+		io->outFill += GBA_NETLINK_MESSAGE_SIZE;
+		ConditionWake(&io->outCond);
 	}
-	return true;
+	MutexUnlock(&io->mutex);
+	if (!queued) {
+		_fail(link, "Sending to partner timed out");
+	}
+	return queued;
 }
 
 static bool _send(struct GBASIONetLink* link, uint8_t type, uint8_t arg8, uint16_t arg16, uint32_t data, uint32_t extra) {
@@ -296,11 +590,6 @@ static void _sendHello(struct GBASIONetLink* link) {
 	uint32_t game;
 	LOAD_32LE(game, 0, link->localGame);
 	_send(link, MSG_HELLO, GBA_NETLINK_PROTOCOL_VERSION, link->playerId, NETLINK_MAGIC, game);
-}
-
-static void _prepareSocket(Socket sock) {
-	SocketSetBlocking(sock, false);
-	SocketSetTCPPush(sock, 1);
 }
 
 static void _handleHello(struct GBASIONetLink* link, const struct GBASIONetLinkMessage* message) {
@@ -511,86 +800,88 @@ static void _dispatch(struct GBASIONetLink* link, const struct GBASIONetLinkMess
 	}
 }
 
+// Handle whatever the I/O thread received, waiting up to timeoutMs for
+// something to arrive. Fails the link if the I/O thread reported an error.
 static void _pump(struct GBASIONetLink* link, int timeoutMs) {
-	if (!_socketReady(link->sock, false, timeoutMs > 0 ? timeoutMs : 0)) {
-		return;
-	}
-	while (!SOCKET_FAILED(link->sock)) {
-		ssize_t received = _recv(link->sock, &link->rxBuffer[link->rxFill], sizeof(link->rxBuffer) - link->rxFill);
-		if (received == 0) {
-			_fail(link, "Partner disconnected");
-			return;
+	struct GBASIONetLinkIO* io = link->io;
+	while (io && link->io == io) {
+		MutexLock(&io->mutex);
+		if (!io->inFill && io->status != IO_FAILED && timeoutMs > 0) {
+			_condWait(&io->cond, &io->mutex, timeoutMs);
 		}
-		if (received < 0) {
-			if (!SocketWouldBlock()) {
-				_failCode(link, "Lost connection to partner", SocketError());
-			}
-			return;
+		timeoutMs = 0;
+		size_t take = sizeof(link->rxBuffer) - link->rxFill;
+		if (take > io->inFill) {
+			take = io->inFill;
 		}
-		link->rxFill += received;
-		link->lastReceive = _nowMicros();
+		if (take) {
+			memcpy(&link->rxBuffer[link->rxFill], io->in, take);
+			memmove(io->in, &io->in[take], io->inFill - take);
+			io->inFill -= take;
+		}
+		bool failed = io->status == IO_FAILED && !io->inFill;
+		char error[GBA_NETLINK_ERROR_LENGTH];
+		if (failed) {
+			memcpy(error, io->error, sizeof(error));
+		}
+		MutexUnlock(&io->mutex);
 
-		size_t offset = 0;
-		while (link->rxFill - offset >= GBA_NETLINK_MESSAGE_SIZE) {
-			struct GBASIONetLinkMessage message;
-			_decode(&link->rxBuffer[offset], &message);
-			offset += GBA_NETLINK_MESSAGE_SIZE;
-			_dispatch(link, &message);
-			if (SOCKET_FAILED(link->sock)) {
-				return;
+		if (take) {
+			link->rxFill += take;
+			link->lastReceive = _nowMicros();
+			size_t offset = 0;
+			while (link->rxFill - offset >= GBA_NETLINK_MESSAGE_SIZE) {
+				struct GBASIONetLinkMessage message;
+				_decode(&link->rxBuffer[offset], &message);
+				offset += GBA_NETLINK_MESSAGE_SIZE;
+				_dispatch(link, &message);
+				if (link->io != io) {
+					// The link failed or was closed while handling the message
+					return;
+				}
+			}
+			if (offset) {
+				memmove(link->rxBuffer, &link->rxBuffer[offset], link->rxFill - offset);
+				link->rxFill -= offset;
 			}
 		}
-		if (offset) {
-			memmove(link->rxBuffer, &link->rxBuffer[offset], link->rxFill - offset);
-			link->rxFill -= offset;
+		if (failed) {
+			_fail(link, error);
+			return;
 		}
-		if (!_socketReady(link->sock, false, 0)) {
+		if (!take) {
 			return;
 		}
 	}
 }
 
 static void _service(struct GBASIONetLink* link, int timeoutMs) {
-	if (link->state == GBA_NETLINK_LISTENING) {
-		if (!_socketReady(link->listener, false, timeoutMs)) {
+	struct GBASIONetLinkIO* io = link->io;
+	if (!io) {
+		return;
+	}
+	if (link->state == GBA_NETLINK_LISTENING || (link->state == GBA_NETLINK_HANDSHAKE && !link->helloSent)) {
+		MutexLock(&io->mutex);
+		if (io->status == IO_STARTING && timeoutMs > 0) {
+			_condWait(&io->cond, &io->mutex, timeoutMs);
+		}
+		enum GBASIONetLinkIOStatus status = io->status;
+		MutexUnlock(&io->mutex);
+		if (status == IO_STARTING) {
+			if (link->state == GBA_NETLINK_HANDSHAKE && _nowMicros() - link->connectStart > CONNECT_TIMEOUT_MS * 1000LL) {
+				_fail(link, "Could not reach the host (timed out)");
+			}
 			return;
 		}
-		Socket sock = SocketAccept(link->listener, NULL);
-		if (SOCKET_FAILED(sock)) {
+		if (status == IO_FAILED) {
+			_pump(link, 0);
 			return;
 		}
-		SocketClose(link->listener);
-		link->listener = INVALID_SOCKET;
-		_prepareSocket(sock);
-		link->sock = sock;
 		link->state = GBA_NETLINK_HANDSHAKE;
+		link->helloSent = true;
 		link->lastReceive = _nowMicros();
 		_sendHello(link);
 		timeoutMs = 0;
-	}
-	if (link->state == GBA_NETLINK_HANDSHAKE && link->connecting) {
-		if (_socketReady(link->sock, true, timeoutMs)) {
-			int error = 0;
-			socklen_t length = sizeof(error);
-			if (getsockopt(link->sock, SOL_SOCKET, SO_ERROR, (char*) &error, &length) != 0) {
-				// Can't tell; a failed connection will show up on the first read
-				error = 0;
-			}
-			if (error) {
-				_failCode(link, "Could not reach the host", error);
-				return;
-			}
-			link->connecting = false;
-			_prepareSocket(link->sock);
-			link->lastReceive = _nowMicros();
-			_sendHello(link);
-			timeoutMs = 0;
-		} else if (_nowMicros() - link->connectStart > CONNECT_TIMEOUT_MS * 1000LL) {
-			_fail(link, "Could not reach the host");
-			return;
-		} else {
-			return;
-		}
 	}
 	if (link->state == GBA_NETLINK_HANDSHAKE) {
 		_pump(link, timeoutMs);
@@ -711,8 +1002,6 @@ void GBASIONetLinkCreate(struct GBASIONetLink* link) {
 	link->remoteEvent.callback = _remoteEvent;
 	link->remoteEvent.name = "GBA SIO Network Link Transfer";
 	link->remoteEvent.priority = 0x80;
-	link->listener = INVALID_SOCKET;
-	link->sock = INVALID_SOCKET;
 	link->localMode = -1;
 	link->timeoutMs = DEFAULT_TIMEOUT_MS;
 	memcpy(link->localGame, "????", 5);
@@ -726,29 +1015,15 @@ void GBASIONetLinkDestroy(struct GBASIONetLink* link) {
 bool GBASIONetLinkHost(struct GBASIONetLink* link, uint16_t port) {
 	GBASIONetLinkDisconnect(link);
 	link->playerId = 0;
-	Socket listener = SocketOpenTCP(port, NULL);
-	if (SOCKET_FAILED(listener)) {
-		_failCode(link, "Could not open the link port", SocketError());
+	if (!_ioStart(link, true, 0, port)) {
+		_fail(link, "Could not start the network thread");
 		return false;
 	}
-	if (SOCKET_FAILED(SocketListen(listener, 1))) {
-		SocketClose(listener);
-		_fail(link, "Could not listen on the link port");
-		return false;
-	}
-	SocketSetBlocking(listener, false);
-	link->listener = listener;
 	link->state = GBA_NETLINK_LISTENING;
 	link->error[0] = '\0';
-	return true;
-}
-
-static bool _connectInProgress(void) {
-#ifdef _WIN32
-	return WSAGetLastError() == WSAEWOULDBLOCK;
-#else
-	return errno == EINPROGRESS || errno == EALREADY || errno == EWOULDBLOCK || errno == EAGAIN;
-#endif
+	// The port is opened on the I/O thread; give it a moment to report problems
+	_service(link, 100);
+	return link->state == GBA_NETLINK_LISTENING || link->state == GBA_NETLINK_HANDSHAKE;
 }
 
 bool GBASIONetLinkConnect(struct GBASIONetLink* link, const char* address, uint16_t port) {
@@ -759,48 +1034,15 @@ bool GBASIONetLinkConnect(struct GBASIONetLink* link, const char* address, uint1
 		_fail(link, "Invalid address");
 		return false;
 	}
-#if defined(GEKKO) || defined(__3DS__)
-	// Plain blocking connect: non-blocking connects are not reliable here
-	Socket sock = SocketConnectTCP(port, &destination);
-	if (SOCKET_FAILED(sock)) {
-		_failCode(link, "Could not reach the host", SocketError());
+	if (!_ioStart(link, false, destination.ipv4, port)) {
+		_fail(link, "Could not start the network thread");
 		return false;
 	}
-	_prepareSocket(sock);
-	link->sock = sock;
 	link->state = GBA_NETLINK_HANDSHAKE;
 	link->error[0] = '\0';
-	link->lastReceive = _nowMicros();
-	_sendHello(link);
-#else
-	Socket sock = SocketCreate(false, IPPROTO_TCP);
-	if (SOCKET_FAILED(sock)) {
-		_failCode(link, "Could not create a socket", SocketError());
-		return false;
-	}
-	SocketSetBlocking(sock, false);
-	struct sockaddr_in info;
-	memset(&info, 0, sizeof(info));
-	info.sin_family = AF_INET;
-	info.sin_port = htons(port);
-	info.sin_addr.s_addr = htonl(destination.ipv4);
-	int result = connect(sock, (const struct sockaddr*) &info, sizeof(info));
-	link->sock = sock;
-	link->state = GBA_NETLINK_HANDSHAKE;
-	link->error[0] = '\0';
-	link->lastReceive = _nowMicros();
-	if (result == 0) {
-		_prepareSocket(sock);
-		_sendHello(link);
-	} else if (_connectInProgress()) {
-		link->connecting = true;
-		link->connectStart = _nowMicros();
-	} else {
-		_failCode(link, "Could not reach the host", SocketError());
-		return false;
-	}
-#endif
-	return link->state == GBA_NETLINK_HANDSHAKE;
+	link->connectStart = _nowMicros();
+	link->lastReceive = link->connectStart;
+	return true;
 }
 
 void GBASIONetLinkDisconnect(struct GBASIONetLink* link) {

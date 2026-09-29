@@ -18,9 +18,9 @@ CXX_GUARD_START
  * Two-player link cable emulation over TCP.
  *
  * One side hosts (player 1, the clock owner in multiplayer mode) and the other
- * side joins (player 2). Everything runs on the emulation thread; there are no
- * helper threads, which keeps it usable on platforms such as the 3DS where
- * socket calls from several threads serialize against each other.
+ * side joins (player 2). All socket calls happen on one small helper thread;
+ * the emulation thread only exchanges messages with it through queues, so a
+ * slow or misbehaving network can stall a game but never freeze it.
  *
  * Synchronization is deliberately looser than the local lockstep driver:
  *  - A transfer started by the host is sent to the partner right away and the
@@ -84,15 +84,16 @@ struct GBASIONetLink {
 	bool attached;
 
 	enum GBASIONetLinkState state;
-	Socket listener;
-	Socket sock;
+	// Sockets live on a helper thread (see netlink.c) so emulation never
+	// makes a socket call that could block.
+	struct GBASIONetLinkIO* io;
+	bool helloSent;
 	int playerId;
 	char error[GBA_NETLINK_ERROR_LENGTH];
 	char localGame[5];
 	char peerGame[5];
 	int64_t lastReceive;
 	int timeoutMs;
-	bool connecting;
 	int64_t connectStart;
 
 	GBASIONetLinkWaitCallback waitCallback;
