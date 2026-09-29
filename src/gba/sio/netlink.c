@@ -11,6 +11,10 @@
 #ifndef _MSC_VER
 #include <sys/time.h>
 #endif
+#if !defined(_WIN32) && !defined(GEKKO)
+#include <poll.h>
+#define NETLINK_USE_POLL
+#endif
 
 #define DRIVER_ID 0x4B4C4E6D // "mNLK"
 #define NETLINK_MAGIC 0x4B4C4E6D
@@ -72,6 +76,43 @@ static int64_t _nowMicros(void) {
 	struct timespec ts;
 	timespec_get(&ts, TIME_UTC);
 	return ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+#endif
+}
+
+// Don't rely on O_NONBLOCK alone: on some systems (e.g. the 3DS) a socket
+// can end up blocking anyway, which would freeze emulation. Only read once the
+// socket says data is there, and ask for a non-blocking read on top.
+static bool _socketReady(Socket sock, bool write, int timeoutMs) {
+	if (SOCKET_FAILED(sock)) {
+		return false;
+	}
+#ifdef NETLINK_USE_POLL
+	struct pollfd pfd;
+	memset(&pfd, 0, sizeof(pfd));
+	pfd.fd = sock;
+	pfd.events = write ? POLLOUT : POLLIN;
+	int result = poll(&pfd, 1, timeoutMs);
+	if (result <= 0) {
+		return false;
+	}
+	return pfd.revents & (pfd.events | POLLHUP | POLLERR);
+#else
+	Socket ready = sock;
+	int result;
+	if (write) {
+		result = SocketPoll(1, NULL, &ready, NULL, timeoutMs);
+	} else {
+		result = SocketPoll(1, &ready, NULL, NULL, timeoutMs);
+	}
+	return result > 0 && !SOCKET_FAILED(ready);
+#endif
+}
+
+static ssize_t _recv(Socket sock, void* buffer, size_t size) {
+#ifdef NETLINK_USE_POLL
+	return recv(sock, buffer, size, MSG_DONTWAIT);
+#else
+	return SocketRecv(sock, buffer, size);
 #endif
 }
 
@@ -230,8 +271,7 @@ static bool _sendFull(struct GBASIONetLink* link, uint8_t type, uint8_t arg8, ui
 				_fail(link, "Sending to partner timed out");
 				return false;
 			}
-			Socket writes = link->sock;
-			SocketPoll(1, NULL, &writes, NULL, 20);
+			_socketReady(link->sock, true, 20);
 			continue;
 		}
 		_fail(link, "Lost connection to partner");
@@ -472,22 +512,18 @@ static void _dispatch(struct GBASIONetLink* link, const struct GBASIONetLinkMess
 }
 
 static void _pump(struct GBASIONetLink* link, int timeoutMs) {
-	if (SOCKET_FAILED(link->sock)) {
+	if (!_socketReady(link->sock, false, timeoutMs > 0 ? timeoutMs : 0)) {
 		return;
 	}
-	if (timeoutMs > 0) {
-		Socket reads = link->sock;
-		SocketPoll(1, &reads, NULL, NULL, timeoutMs);
-	}
 	while (!SOCKET_FAILED(link->sock)) {
-		ssize_t received = SocketRecv(link->sock, &link->rxBuffer[link->rxFill], sizeof(link->rxBuffer) - link->rxFill);
+		ssize_t received = _recv(link->sock, &link->rxBuffer[link->rxFill], sizeof(link->rxBuffer) - link->rxFill);
 		if (received == 0) {
 			_fail(link, "Partner disconnected");
 			return;
 		}
 		if (received < 0) {
 			if (!SocketWouldBlock()) {
-				_fail(link, "Lost connection to partner");
+				_failCode(link, "Lost connection to partner", SocketError());
 			}
 			return;
 		}
@@ -508,13 +544,15 @@ static void _pump(struct GBASIONetLink* link, int timeoutMs) {
 			memmove(link->rxBuffer, &link->rxBuffer[offset], link->rxFill - offset);
 			link->rxFill -= offset;
 		}
+		if (!_socketReady(link->sock, false, 0)) {
+			return;
+		}
 	}
 }
 
 static void _service(struct GBASIONetLink* link, int timeoutMs) {
 	if (link->state == GBA_NETLINK_LISTENING) {
-		Socket reads = link->listener;
-		if (SocketPoll(1, &reads, NULL, NULL, timeoutMs) <= 0) {
+		if (!_socketReady(link->listener, false, timeoutMs)) {
 			return;
 		}
 		Socket sock = SocketAccept(link->listener, NULL);
@@ -531,17 +569,14 @@ static void _service(struct GBASIONetLink* link, int timeoutMs) {
 		timeoutMs = 0;
 	}
 	if (link->state == GBA_NETLINK_HANDSHAKE && link->connecting) {
-		Socket writes = link->sock;
-		Socket errors = link->sock;
-		int ready = SocketPoll(1, NULL, &writes, &errors, timeoutMs);
-		if (ready > 0) {
+		if (_socketReady(link->sock, true, timeoutMs)) {
 			int error = 0;
 			socklen_t length = sizeof(error);
 			if (getsockopt(link->sock, SOL_SOCKET, SO_ERROR, (char*) &error, &length) != 0) {
 				// Can't tell; a failed connection will show up on the first read
 				error = 0;
 			}
-			if (error || (SOCKET_FAILED(writes) && !SOCKET_FAILED(errors))) {
+			if (error) {
 				_failCode(link, "Could not reach the host", error);
 				return;
 			}

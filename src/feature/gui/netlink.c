@@ -489,6 +489,14 @@ bool mGUINetLinkDrawStatus(struct mGUIRunner* runner) {
 	struct GUIParams* params = &runner->params;
 	unsigned lineHeight = GUIFontHeight(params->font);
 	bool drew = false;
+	if (netlink->attached && GBASIONetLinkGetState(&netlink->link) == GBA_NETLINK_CONNECTED) {
+		// Small status line: player, partner's serial mode and transfer count
+		char status[48];
+		snprintf(status, sizeof(status), "Link P%i m%i/%i #%u", netlink->link.playerId + 1,
+		         netlink->link.localMode, netlink->link.peerMode, (unsigned) netlink->link.stats.transfers);
+		GUIFontPrint(params->font, 0, params->height - lineHeight / 2, GUI_ALIGN_LEFT, 0x7FFFFFFF, status);
+		drew = true;
+	}
 	if (netlink->noticeUntil) {
 		if (_now() < netlink->noticeUntil) {
 			GUIFontPrint(params->font, params->width / 2, params->height - lineHeight / 2, GUI_ALIGN_HCENTER, netlink->noticeColor, netlink->notice);
@@ -502,7 +510,10 @@ bool mGUINetLinkDrawStatus(struct mGUIRunner* runner) {
 
 bool mGUINetLinkWantsOSD(struct mGUIRunner* runner) {
 	struct mGUINetLink* netlink = _get(runner);
-	return netlink && netlink->noticeUntil;
+	if (!netlink) {
+		return false;
+	}
+	return netlink->noticeUntil || (netlink->attached && GBASIONetLinkGetState(&netlink->link) == GBA_NETLINK_CONNECTED);
 }
 
 void mGUINetLinkGameUnloading(struct mGUIRunner* runner) {
