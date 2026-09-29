@@ -15,6 +15,7 @@
 #include <mgba/internal/gb/gb.h>
 #endif
 #include "feature/gui/gui-runner.h"
+#include "feature/gui/netlink.h"
 #include <mgba-util/gui.h>
 #include <mgba-util/gui/file-select.h>
 #include <mgba-util/gui/font.h>
@@ -822,6 +823,23 @@ static enum GUIKeyboardStatus _keyboardRun(struct GUIKeyboardParams* keyboard) {
 	}
 }
 
+static void _aptHook(APT_HookType hook, void* context) {
+	struct mGUIRunner* runner = context;
+	switch (hook) {
+	case APTHOOK_ONSUSPEND:
+	case APTHOOK_ONSLEEP:
+		// Let a link cable partner know we are gone for a while
+		mGUINetLinkSetSystemPaused(runner, true);
+		break;
+	case APTHOOK_ONRESTORE:
+	case APTHOOK_ONWAKEUP:
+		mGUINetLinkSetSystemPaused(runner, false);
+		break;
+	default:
+		break;
+	}
+}
+
 THREAD_ENTRY _core2Test(void* context) {
 	UNUSED(context);
 }
@@ -1087,11 +1105,15 @@ int main(int argc, char* argv[]) {
 	_map3DSKey(&runner.params.keyMap, KEY_CSTICK_UP, mGUI_INPUT_INCREASE_BRIGHTNESS);
 	_map3DSKey(&runner.params.keyMap, KEY_CSTICK_DOWN, mGUI_INPUT_DECREASE_BRIGHTNESS);
 
+	aptHookCookie aptCookie;
+	aptHook(&aptCookie, _aptHook, &runner);
+
 	Result res = romfsInit();
 	bool useRomfs = false;
 	if (R_SUCCEEDED(res)) {
 		useRomfs = mGUIGetRom(&runner, initialPath, sizeof(initialPath));
 		if (!useRomfs) {
+			aptUnhook(&aptCookie);
 			romfsExit();
 			GUIFontDestroy(font);
 			_cleanup();
@@ -1106,6 +1128,7 @@ int main(int argc, char* argv[]) {
 		mGUIRunloop(&runner);
 	}
 
+	aptUnhook(&aptCookie);
 	mGUIDeinit(&runner);
 
 	if (useRomfs) {

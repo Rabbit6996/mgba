@@ -39,6 +39,9 @@ set(SIO_FILES
 	sio/dolphin.c
 	sio/lockstep.c)
 
+set(NETLINK_FILES
+	sio/netlink.c)
+
 set(EXTRA_FILES
 	extra/battlechip.c
 	extra/proxy.c)
@@ -51,12 +54,13 @@ set(TEST_FILES
 	test/core.c)
 
 source_group("GBA board" FILES ${SOURCE_FILES})
-source_group("GBA extras" FILES ${EXTRA_FILES} ${SIO_FILES})
+source_group("GBA extras" FILES ${EXTRA_FILES} ${SIO_FILES} ${NETLINK_FILES})
 source_group("GBA debugger" FILES ${DEBUGGER_FILES})
 source_group("GBA tests" FILES ${TEST_FILES})
 
 export_directory(GBA SOURCE_FILES)
 export_directory(GBA_SIO SIO_FILES)
+export_directory(GBA_NETLINK NETLINK_FILES)
 export_directory(GBA_EXTRA EXTRA_FILES)
 export_directory(GBA_DEBUGGER DEBUGGER_FILES)
 export_directory(GBA_TEST TEST_FILES)

@@ -9,6 +9,7 @@
 #include <mgba/core/serialize.h>
 #include "feature/gui/gui-config.h"
 #include "feature/gui/cheats.h"
+#include "feature/gui/netlink.h"
 #include <mgba/internal/gba/gba.h>
 #include <mgba/internal/gba/input.h>
 #include <mgba/gba/interface.h>
@@ -43,6 +44,7 @@ enum {
 	RUNNER_CONFIG,
 	RUNNER_RESET,
 	RUNNER_CHEATS,
+	RUNNER_NETLINK,
 	RUNNER_COMMAND_MASK = 0xFFFF
 };
 
@@ -453,6 +455,21 @@ void mGUIRun(struct mGUIRunner* runner, const char* path) {
 	if (runner->core->platform(runner->core) == mPLATFORM_GBA) {
 		runner->core->setPeripheral(runner->core, mPERIPH_GBA_LUMINANCE, &runner->luminanceSource.d);
 	}
+	if (mGUINetLinkAvailable(runner)) {
+		// Only known once the core is loaded, so insert it before "Configure"
+		size_t i;
+		for (i = 0; i < GUIMenuItemListSize(&pauseMenu.items); ++i) {
+			if (GUIVariantCompareUInt(GUIMenuItemListGetPointer(&pauseMenu.items, i)->data, RUNNER_CONFIG)) {
+				break;
+			}
+		}
+		if (i < GUIMenuItemListSize(&pauseMenu.items)) {
+			GUIMenuItemListUnshift(&pauseMenu.items, i, 1);
+			*GUIMenuItemListGetPointer(&pauseMenu.items, i) = (struct GUIMenuItem) { .title = "Link cable (Wi-Fi)", .data = GUI_V_U(RUNNER_NETLINK) };
+		} else {
+			*GUIMenuItemListAppend(&pauseMenu.items) = (struct GUIMenuItem) { .title = "Link cable (Wi-Fi)", .data = GUI_V_U(RUNNER_NETLINK) };
+		}
+	}
 	mLOG(GUI_RUNNER, DEBUG, "Loading config...");
 	mCoreLoadForeignConfig(runner->core, &runner->config);
 
@@ -573,16 +590,21 @@ void mGUIRun(struct mGUIRunner* runner, const char* path) {
 				runner->prepareForFrame(runner);
 			}
 			runner->core->setKeys(runner->core, keys);
+			mGUINetLinkFrame(runner);
 			runner->core->runFrame(runner->core);
 			if (runner->drawFrame) {
 				runner->params.drawStart();
 				runner->drawFrame(runner, false);
-				if (showOSD || drawFps) {
+				bool linkOSD = mGUINetLinkWantsOSD(runner);
+				if (showOSD || drawFps || linkOSD) {
 					if (runner->params.guiPrepare) {
 						runner->params.guiPrepare();
 					}
 					if (drawFps) {
 						GUIFontPrintf(runner->params.font, 0, GUIFontHeight(runner->params.font), GUI_ALIGN_LEFT, 0x7FFFFFFF, "%.2f fps", runner->fps);
+					}
+					if (linkOSD) {
+						mGUINetLinkDrawStatus(runner);
 					}
 					if (showOSD) {
 						unsigned origin = runner->params.width - GUIFontHeight(runner->params.font) / 2;
@@ -641,6 +663,7 @@ void mGUIRun(struct mGUIRunner* runner, const char* path) {
 		if (runner->paused) {
 			runner->paused(runner);
 		}
+		mGUINetLinkSetMenuPaused(runner, true);
 		if (runner->setFrameLimiter) {
 			runner->setFrameLimiter(runner, true);
 		}
@@ -676,6 +699,9 @@ void mGUIRun(struct mGUIRunner* runner, const char* path) {
 			case RUNNER_CHEATS:
 				mGUIShowCheats(runner);
 				break;
+			case RUNNER_NETLINK:
+				mGUINetLinkShowMenu(runner);
+				break;
 			case RUNNER_CONTINUE:
 				break;
 			}
@@ -698,6 +724,7 @@ void mGUIRun(struct mGUIRunner* runner, const char* path) {
 			++frames;
 			GUIPollInput(&runner->params, 0, &keys);
 		}
+		mGUINetLinkSetMenuPaused(runner, false);
 		if (runner->unpaused) {
 			runner->unpaused(runner);
 		}
@@ -713,6 +740,7 @@ void mGUIRun(struct mGUIRunner* runner, const char* path) {
 #endif
 	}
 	mLOG(GUI_RUNNER, DEBUG, "Shutting down...");
+	mGUINetLinkGameUnloading(runner);
 	if (runner->gameUnloaded) {
 		runner->gameUnloaded(runner);
 	}

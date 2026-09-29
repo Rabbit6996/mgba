@@ -1,0 +1,29 @@
+name: Build 3DS
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-3ds:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build with the mgba/3ds toolchain image
+        run: |
+          # The image builds as its own user, so let it write to the checkout
+          chmod -R a+rwX .
+          docker run --rm -t -e MAKEFLAGS=-j4 -v "$PWD:/home/mgba/src" mgba/3ds
+
+      - name: Collect binaries
+        run: |
+          mkdir -p out
+          find . -path ./out -prune -o \( -name '*.3dsx' -o -name '*.cia' \) -print -exec cp {} out/ \;
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mgba-3ds
+          path: out/
+          if-no-files-found: error

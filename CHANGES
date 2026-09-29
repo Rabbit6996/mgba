@@ -7,6 +7,7 @@ Features:
  - Cheats: Add support for CodeBreaker 5XXXXXXX "Super" codes
  - Cheats: Add support for additional, undocumented GameShark IF code types
  - 3DS: Add faster "loose" sync mode, default enabled
+ - 3DS: Two-player GBA link cable over Wi-Fi (trading/battles in e.g. Pokemon Gen 3)
  - Vita: Allow using rear touch pads as L2/L3/R2/R3
  - Wii: Add screen modes optimizing for a 4:3 or 16:9 display
  - Scripting: New `input` API for getting raw keyboard/mouse/controller state

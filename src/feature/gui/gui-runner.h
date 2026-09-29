@@ -75,6 +75,9 @@ struct mGUIRunner {
 
 	struct GUIInputKeys* keySources;
 
+	// Link cable over Wi-Fi state, see feature/gui/netlink.h
+	struct mGUINetLink* netlink;
+
 	const char* port;
 	float fps;
 	int64_t lastFpsCheck;
