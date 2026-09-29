@@ -24,18 +24,12 @@ jobs:
 
       - name: Check the Wi-Fi link is built in
         run: |
-          echo "::warning::outputs: $(ls out | tr '\n' ' ')"
-          echo "::warning::build dirs: $(ls -d build* 2>/dev/null | tr '\n' ' ')"
-          echo "::warning::cache: $(grep -rh -E '^(ENABLE_NETLINK|CMAKE_TOOLCHAIN_FILE|3DS)[:=]' --include=CMakeCache.txt . | tr '\n' ' ')"
-          echo "::warning::flags.h: $(grep -rh -A1 'ifndef ENABLE_NETLINK' --include=flags.h . | tr '\n' ' ')"
-          echo "::warning::elf: $(find . -name '*.elf' | tr '\n' ' ')"
-          for f in $(find . -name '*.elf') out/*.3dsx; do
-            echo "::warning::$f menu=$(grep -a -c 'Link cable (Wi-Fi)' "$f") pause=$(grep -a -c 'Game Paused' "$f")"
+          for f in out/*.3dsx; do
+            echo "$f: $(grep -a -c 'Link cable (Wi-Fi)' "$f") match(es)"
+            grep -a -q 'Link cable (Wi-Fi)' "$f"
           done
-          grep -a -q 'Link cable (Wi-Fi)' out/*.3dsx
 
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
           name: mgba-3ds
           path: out/
