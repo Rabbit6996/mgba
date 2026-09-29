@@ -1,0 +1,5 @@
+netlink-test
+mock-gui
+*.log
+*.sav
+*.elf
