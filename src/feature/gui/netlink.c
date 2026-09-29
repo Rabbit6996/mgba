@@ -291,8 +291,8 @@ static bool _waitForPartner(struct mGUIRunner* runner, struct mGUINetLink* netli
 static void _host(struct mGUIRunner* runner, struct mGUINetLink* netlink) {
 	uint16_t port = _port(runner);
 	if (!GBASIONetLinkHost(&netlink->link, port)) {
-		char error[GBA_NETLINK_ERROR_LENGTH + 8];
-		snprintf(error, sizeof(error), "%s.", GBASIONetLinkGetError(&netlink->link));
+		char error[GBA_NETLINK_ERROR_LENGTH + 32];
+		snprintf(error, sizeof(error), "%s. Is player 1 waiting?", GBASIONetLinkGetError(&netlink->link));
 		GBASIONetLinkDisconnect(&netlink->link);
 		_showMessage(runner, "Link failed", error);
 		return;
@@ -345,9 +345,10 @@ static void _join(struct mGUIRunner* runner, struct mGUINetLink* netlink) {
 	char target[64];
 	snprintf(target, sizeof(target), "%.40s, port %u", keyboard.result, port);
 	const char* connecting[] = { target };
+	_drawScreen(runner, "Connecting...", connecting, NULL, 1);
 	if (!GBASIONetLinkConnect(&netlink->link, keyboard.result, port)) {
-		char error[GBA_NETLINK_ERROR_LENGTH + 8];
-		snprintf(error, sizeof(error), "%s.", GBASIONetLinkGetError(&netlink->link));
+		char error[GBA_NETLINK_ERROR_LENGTH + 32];
+		snprintf(error, sizeof(error), "%s. Is player 1 waiting?", GBASIONetLinkGetError(&netlink->link));
 		GBASIONetLinkDisconnect(&netlink->link);
 		_showMessage(runner, "Link failed", error);
 		return;

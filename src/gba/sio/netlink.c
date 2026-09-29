@@ -178,6 +178,12 @@ static void _fail(struct GBASIONetLink* link, const char* reason) {
 	_updateSioBits(link);
 }
 
+static void _failCode(struct GBASIONetLink* link, const char* reason, int code) {
+	char text[GBA_NETLINK_ERROR_LENGTH];
+	snprintf(text, sizeof(text), "%s (code %d)", reason, code);
+	_fail(link, text);
+}
+
 static void _encode(const struct GBASIONetLinkMessage* message, uint8_t* buffer) {
 	buffer[0] = message->type;
 	buffer[1] = message->arg8;
@@ -536,7 +542,7 @@ static void _service(struct GBASIONetLink* link, int timeoutMs) {
 				error = 0;
 			}
 			if (error || (SOCKET_FAILED(writes) && !SOCKET_FAILED(errors))) {
-				_fail(link, "Could not reach the host");
+				_failCode(link, "Could not reach the host", error);
 				return;
 			}
 			link->connecting = false;
@@ -687,7 +693,7 @@ bool GBASIONetLinkHost(struct GBASIONetLink* link, uint16_t port) {
 	link->playerId = 0;
 	Socket listener = SocketOpenTCP(port, NULL);
 	if (SOCKET_FAILED(listener)) {
-		_fail(link, "Could not open the link port");
+		_failCode(link, "Could not open the link port", SocketError());
 		return false;
 	}
 	if (SOCKET_FAILED(SocketListen(listener, 1))) {
@@ -718,10 +724,11 @@ bool GBASIONetLinkConnect(struct GBASIONetLink* link, const char* address, uint1
 		_fail(link, "Invalid address");
 		return false;
 	}
-#ifdef GEKKO
+#if defined(GEKKO) || defined(__3DS__)
+	// Plain blocking connect: non-blocking connects are not reliable here
 	Socket sock = SocketConnectTCP(port, &destination);
 	if (SOCKET_FAILED(sock)) {
-		_fail(link, "Could not reach the host");
+		_failCode(link, "Could not reach the host", SocketError());
 		return false;
 	}
 	_prepareSocket(sock);
@@ -733,7 +740,7 @@ bool GBASIONetLinkConnect(struct GBASIONetLink* link, const char* address, uint1
 #else
 	Socket sock = SocketCreate(false, IPPROTO_TCP);
 	if (SOCKET_FAILED(sock)) {
-		_fail(link, "Could not create a socket");
+		_failCode(link, "Could not create a socket", SocketError());
 		return false;
 	}
 	SocketSetBlocking(sock, false);
@@ -754,7 +761,7 @@ bool GBASIONetLinkConnect(struct GBASIONetLink* link, const char* address, uint1
 		link->connecting = true;
 		link->connectStart = _nowMicros();
 	} else {
-		_fail(link, "Could not reach the host");
+		_failCode(link, "Could not reach the host", SocketError());
 		return false;
 	}
 #endif
