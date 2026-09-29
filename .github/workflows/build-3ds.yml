@@ -22,6 +22,14 @@ jobs:
           find . -path ./out -prune -o \( -name '*.3dsx' -o -name '*.cia' \) -print -exec cp {} out/ \;
           ls -l out
 
+      - name: Check the Wi-Fi link is built in
+        run: |
+          grep -rh "ENABLE_NETLINK" --include=flags.h . || true
+          for f in out/*.3dsx; do
+            echo "$f: $(grep -a -c 'Link cable (Wi-Fi)' "$f") match(es)"
+            grep -a -q 'Link cable (Wi-Fi)' "$f"
+          done
+
       - uses: actions/upload-artifact@v4
         with:
           name: mgba-3ds
