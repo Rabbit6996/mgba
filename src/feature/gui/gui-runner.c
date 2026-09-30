@@ -592,6 +592,7 @@ void mGUIRun(struct mGUIRunner* runner, const char* path) {
 			runner->core->setKeys(runner->core, keys);
 			mGUINetLinkFrame(runner);
 			runner->core->runFrame(runner->core);
+			mGUINetLinkFrameDone(runner);
 			if (runner->drawFrame) {
 				runner->params.drawStart();
 				runner->drawFrame(runner, false);

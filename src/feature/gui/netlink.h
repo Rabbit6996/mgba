@@ -18,6 +18,7 @@ struct mGUIRunner;
 bool mGUINetLinkAvailable(struct mGUIRunner*);
 void mGUINetLinkShowMenu(struct mGUIRunner*);
 void mGUINetLinkFrame(struct mGUIRunner*);
+void mGUINetLinkFrameDone(struct mGUIRunner*);
 void mGUINetLinkSetMenuPaused(struct mGUIRunner*, bool paused);
 void mGUINetLinkSetSystemPaused(struct mGUIRunner*, bool paused);
 bool mGUINetLinkWantsOSD(struct mGUIRunner*);

@@ -72,31 +72,13 @@ static int64_t _now(void) {
 }
 
 static void _logf(struct mGUINetLink* netlink, const char* format, ...) {
-	if (!netlink->log) {
-		char path[PATH_MAX];
-		mCoreConfigDirectory(path, sizeof(path));
-		strncat(path, PATH_SEP "netlink.log", sizeof(path) - strlen(path) - 1);
-		netlink->log = VFileOpen(path, O_CREAT | O_WRONLY | O_APPEND);
-		if (!netlink->log) {
-			return;
-		}
-		netlink->logStart = _now();
-		const char* header = "---- mGBA Wi-Fi link session ----\n";
-		netlink->log->write(netlink->log, header, strlen(header));
-	}
-	char line[256];
-	int64_t t = _now() - netlink->logStart;
-	int length = snprintf(line, sizeof(line), "[%4u.%03us] ", (unsigned) (t / 1000000), (unsigned) (t / 1000 % 1000));
+	UNUSED(netlink);
+	char line[200];
 	va_list args;
 	va_start(args, format);
-	length += vsnprintf(&line[length], sizeof(line) - length - 1, format, args);
+	vsnprintf(line, sizeof(line), format, args);
 	va_end(args);
-	if (length > (int) sizeof(line) - 2) {
-		length = sizeof(line) - 2;
-	}
-	line[length++] = '\n';
-	netlink->log->write(netlink->log, line, length);
-	netlink->log->sync(netlink->log, NULL, 0);
+	GBASIONetLinkLog("%s", line);
 }
 
 static void _logStats(struct mGUINetLink* netlink, const char* what) {
@@ -141,6 +123,25 @@ static void _setNotice(struct mGUINetLink* netlink, uint32_t color, const char* 
 	netlink->noticeUntil = _now() + NOTICE_DURATION_US;
 }
 
+// Diagnostic build: show the most recent log line at the bottom
+static void _drawLastLog(struct mGUIRunner* runner) {
+	struct GUIParams* params = &runner->params;
+	unsigned lineHeight = GUIFontHeight(params->font);
+	const char* last = GBASIONetLinkLastLog();
+	char text[52];
+	size_t skip = 0;
+	const char* bracket = strchr(last, ']');
+	if (bracket) {
+		skip = bracket - last + 2;
+		if (skip > strlen(last)) {
+			skip = strlen(last);
+		}
+	}
+	strncpy(text, &last[skip], sizeof(text) - 1);
+	text[sizeof(text) - 1] = '\0';
+	GUIFontPrint(params->font, 0, params->height - lineHeight * 3 / 2, GUI_ALIGN_LEFT, 0xFF80FFFF, text);
+}
+
 static void _drawScreen(struct mGUIRunner* runner, const char* title, const char* const* lines, const uint32_t* colors, size_t nLines) {
 	struct GUIParams* params = &runner->params;
 	unsigned lineHeight = GUIFontHeight(params->font);
@@ -161,6 +162,7 @@ static void _drawScreen(struct mGUIRunner* runner, const char* title, const char
 		}
 		y += lineHeight;
 	}
+	_drawLastLog(runner);
 	if (params->guiFinish) {
 		params->guiFinish();
 	}
@@ -241,6 +243,11 @@ static struct mGUINetLink* _ensure(struct mGUIRunner* runner) {
 		if (!netlink) {
 			return NULL;
 		}
+		char path[PATH_MAX];
+		mCoreConfigDirectory(path, sizeof(path));
+		strncat(path, PATH_SEP "netlink.log", sizeof(path) - strlen(path) - 1);
+		GBASIONetLinkSetLogFile(path);
+		GBASIONetLinkLog("==== new session (diagnostic build) ====");
 		GBASIONetLinkCreate(&netlink->link);
 		netlink->link.waitCallback = _waitCallback;
 		netlink->link.waitContext = runner;
@@ -337,10 +344,15 @@ static bool _waitForPartner(struct mGUIRunner* runner, struct mGUINetLink* netli
 	snprintf(partner, sizeof(partner), "You are player %i. Partner game: %s", netlink->link.playerId + 1, netlink->link.peerGame);
 	const char* done[] = { partner };
 	int64_t until = _now() + CONNECTED_NOTICE_US;
-	while (_now() < until && _stillRunning(runner)) {
+	int draws = 0;
+	GBASIONetLinkLog("gui: connected screen");
+	// Bounded by a draw count too, in case the clock doesn't advance
+	while (_now() < until && draws < 75 && _stillRunning(runner)) {
 		GBASIONetLinkUpdate(&netlink->link, 10);
 		_drawScreen(runner, "Connected!", done, NULL, 1);
+		++draws;
 	}
+	GBASIONetLinkLog("gui: connected screen done after %i draws", draws);
 	GUIInvalidateKeys(&runner->params);
 	return true;
 }
@@ -497,12 +509,16 @@ void mGUINetLinkShowMenu(struct mGUIRunner* runner) {
 		}
 	}
 	GUIMenuItemListDeinit(&menu.items);
+	GBASIONetLinkLog("gui: link menu closed");
 }
 
 void mGUINetLinkFrame(struct mGUIRunner* runner) {
 	struct mGUINetLink* netlink = _get(runner);
 	if (!netlink || !netlink->attached) {
 		return;
+	}
+	if (netlink->frames < 10 || netlink->frames % 600 == 0) {
+		GBASIONetLinkLog("gui: frame %u starting", netlink->frames);
 	}
 	GBASIONetLinkEnsureScheduled(&netlink->link);
 	enum GBASIONetLinkState state = GBASIONetLinkGetState(&netlink->link);
@@ -534,11 +550,22 @@ static void _applyPause(struct mGUINetLink* netlink) {
 	GBASIONetLinkSetPaused(&netlink->link, netlink->menuPaused || netlink->systemPaused);
 }
 
+void mGUINetLinkFrameDone(struct mGUIRunner* runner) {
+	struct mGUINetLink* netlink = _get(runner);
+	if (!netlink || !netlink->attached) {
+		return;
+	}
+	if (netlink->frames <= 10 || netlink->frames % 600 == 0) {
+		GBASIONetLinkLog("gui: frame %u done", netlink->frames - 1);
+	}
+}
+
 void mGUINetLinkSetMenuPaused(struct mGUIRunner* runner, bool paused) {
 	struct mGUINetLink* netlink = _get(runner);
 	if (!netlink) {
 		return;
 	}
+	GBASIONetLinkLog("gui: menu %s", paused ? "opened" : "closed, back to game");
 	netlink->menuPaused = paused;
 	_applyPause(netlink);
 }
@@ -566,6 +593,7 @@ bool mGUINetLinkDrawStatus(struct mGUIRunner* runner) {
 		snprintf(status, sizeof(status), "Link P%i m%i/%i #%u", netlink->link.playerId + 1,
 		         netlink->link.localMode, netlink->link.peerMode, (unsigned) netlink->link.stats.transfers);
 		GUIFontPrint(params->font, 0, params->height - lineHeight / 2, GUI_ALIGN_LEFT, 0x7FFFFFFF, status);
+		_drawLastLog(runner);
 		drew = true;
 	}
 	if (netlink->noticeUntil) {
@@ -596,9 +624,7 @@ void mGUINetLinkGameUnloading(struct mGUIRunner* runner) {
 	if (netlink->socketsReady) {
 		SocketSubsystemDeinit();
 	}
-	if (netlink->log) {
-		netlink->log->close(netlink->log);
-	}
+	GBASIONetLinkLog("game unloading");
 	free(netlink);
 	runner->netlink = NULL;
 }
@@ -615,6 +641,10 @@ void mGUINetLinkShowMenu(struct mGUIRunner* runner) {
 }
 
 void mGUINetLinkFrame(struct mGUIRunner* runner) {
+	UNUSED(runner);
+}
+
+void mGUINetLinkFrameDone(struct mGUIRunner* runner) {
 	UNUSED(runner);
 }
 

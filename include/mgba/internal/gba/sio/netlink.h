@@ -162,6 +162,13 @@ void GBASIONetLinkEnsureScheduled(struct GBASIONetLink* link);
 enum GBASIONetLinkState GBASIONetLinkGetState(const struct GBASIONetLink* link);
 const char* GBASIONetLinkGetError(const struct GBASIONetLink* link);
 
+// Diagnostics: append timestamped lines to a file. Each line is written with
+// its own open/close so it survives the system being switched off hard.
+void GBASIONetLinkSetLogFile(const char* path);
+void GBASIONetLinkLog(const char* format, ...);
+// The most recent line logged, for showing on screen
+const char* GBASIONetLinkLastLog(void);
+
 bool GBASIONetLinkParseAddress(const char* text, struct Address* address);
 bool GBASIONetLinkGetLocalAddress(char* out, size_t outLength);
 

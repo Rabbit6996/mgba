@@ -8,6 +8,9 @@
 #include <mgba/internal/gba/gba.h>
 #include <mgba/internal/gba/io.h>
 #include <mgba-util/threading.h>
+#include <mgba-util/vfs.h>
+
+#include <stdarg.h>
 
 #ifndef _MSC_VER
 #include <sys/time.h>
@@ -114,6 +117,73 @@ static ssize_t _recv(Socket sock, void* buffer, size_t size) {
 	return recv(sock, buffer, size, MSG_DONTWAIT);
 #else
 	return SocketRecv(sock, buffer, size);
+#endif
+}
+
+/* ---- Diagnostic log ---- */
+
+static char _logPath[PATH_MAX];
+static char _logLast[128];
+static int64_t _logStart;
+#ifdef __3DS__
+static LightLock _logLock;
+static bool _logLockInit;
+#endif
+
+void GBASIONetLinkSetLogFile(const char* path) {
+#ifdef __3DS__
+	if (!_logLockInit) {
+		LightLock_Init(&_logLock);
+		_logLockInit = true;
+	}
+#endif
+	if (!path) {
+		_logPath[0] = '\0';
+		return;
+	}
+	strncpy(_logPath, path, sizeof(_logPath) - 1);
+	_logPath[sizeof(_logPath) - 1] = '\0';
+	_logStart = _nowMicros();
+}
+
+const char* GBASIONetLinkLastLog(void) {
+	return _logLast;
+}
+
+void GBASIONetLinkLog(const char* format, ...) {
+	char line[256];
+	int64_t t = _nowMicros() - _logStart;
+	int length;
+#ifdef __3DS__
+	// Also log the hardware tick counter in case the clock misbehaves
+	length = snprintf(line, sizeof(line), "[%6.3f tick=%llu] ", t / 1e6, (unsigned long long) (svcGetSystemTick() / 268111));
+#else
+	length = snprintf(line, sizeof(line), "[%6.3f] ", t / 1e6);
+#endif
+	va_list args;
+	va_start(args, format);
+	length += vsnprintf(&line[length], sizeof(line) - length - 1, format, args);
+	va_end(args);
+	if (length > (int) sizeof(line) - 2) {
+		length = sizeof(line) - 2;
+	}
+	line[length] = '\0';
+	strncpy(_logLast, line, sizeof(_logLast) - 1);
+	_logLast[sizeof(_logLast) - 1] = '\0';
+	line[length++] = '\n';
+	if (!_logPath[0]) {
+		return;
+	}
+#ifdef __3DS__
+	LightLock_Lock(&_logLock);
+#endif
+	struct VFile* vf = VFileOpen(_logPath, O_CREAT | O_WRONLY | O_APPEND);
+	if (vf) {
+		vf->write(vf, line, length);
+		vf->close(vf);
+	}
+#ifdef __3DS__
+	LightLock_Unlock(&_logLock);
 #endif
 }
 
@@ -275,7 +345,9 @@ static Socket _ioOpen(struct GBASIONetLinkIO* io) {
 
 static THREAD_ENTRY _ioThread(void* context) {
 	struct GBASIONetLinkIO* io = context;
+	GBASIONetLinkLog("io: thread running, %s", io->host ? "listening" : "connecting");
 	Socket sock = _ioOpen(io);
+	GBASIONetLinkLog("io: socket %s", SOCKET_FAILED(sock) ? "failed" : "open");
 	if (!SOCKET_FAILED(sock)) {
 		SocketSetBlocking(sock, false);
 		SocketSetTCPPush(sock, 1);
@@ -289,7 +361,14 @@ static THREAD_ENTRY _ioThread(void* context) {
 
 	uint8_t rx[1024];
 	int64_t lastActivity = _nowMicros();
+	int64_t lastHeartbeat = lastActivity;
+	unsigned long long bytesIn = 0, bytesOut = 0, loops = 0;
 	while (!SOCKET_FAILED(sock)) {
+		++loops;
+		if (_nowMicros() - lastHeartbeat > 3000000) {
+			lastHeartbeat = _nowMicros();
+			GBASIONetLinkLog("io: alive loops=%llu in=%llu out=%llu", loops, bytesIn, bytesOut);
+		}
 		MutexLock(&io->mutex);
 		bool quit = io->quit;
 		if (io->outFill && io->pendingFill < sizeof(io->pending)) {
@@ -308,6 +387,7 @@ static THREAD_ENTRY _ioThread(void* context) {
 			lastActivity = _nowMicros();
 			ssize_t sent = _socketSend(sock, io->pending, io->pendingFill);
 			if (sent > 0) {
+				bytesOut += sent;
 				memmove(io->pending, &io->pending[sent], io->pendingFill - sent);
 				io->pendingFill -= sent;
 			} else if (sent < 0 && !SocketWouldBlock()) {
@@ -346,6 +426,7 @@ static THREAD_ENTRY _ioThread(void* context) {
 			continue;
 		}
 		lastActivity = _nowMicros();
+		bytesIn += received;
 		MutexLock(&io->mutex);
 		bool overflow = io->inFill + received > sizeof(io->in);
 		if (!overflow) {
@@ -359,6 +440,7 @@ static THREAD_ENTRY _ioThread(void* context) {
 			break;
 		}
 	}
+	GBASIONetLinkLog("io: thread ending (quit=%i status=%i) in=%llu out=%llu", io->quit, io->status, bytesIn, bytesOut);
 	if (!SOCKET_FAILED(sock)) {
 		SocketClose(sock);
 	}
@@ -388,6 +470,7 @@ static bool _ioStart(struct GBASIONetLink* link, bool host, uint32_t address, ui
 	size_t i;
 	for (i = 0; i < sizeof(cores) / sizeof(*cores) && !started; ++i) {
 		started = threadCreate(_ioThread, io, 0x4000, 0x18, cores[i], true) != NULL;
+		GBASIONetLinkLog("io: thread on core %i %s", cores[i], started ? "started" : "failed");
 	}
 #else
 	Thread thread;
@@ -515,18 +598,13 @@ static void _updateEngaged(struct GBASIONetLink* link) {
 
 static void _fail(struct GBASIONetLink* link, const char* reason) {
 	mLOG(GBA_SIO, WARN, "Network link: %s", reason);
+	GBASIONetLinkLog("FAIL: %s (state %i)", reason, link->state);
 	_closeSockets(link);
 	link->state = GBA_NETLINK_ERROR;
 	strncpy(link->error, reason, sizeof(link->error) - 1);
 	link->error[sizeof(link->error) - 1] = '\0';
 	_resetSession(link);
 	_updateSioBits(link);
-}
-
-static void _failCode(struct GBASIONetLink* link, const char* reason, int code) {
-	char text[GBA_NETLINK_ERROR_LENGTH];
-	snprintf(text, sizeof(text), "%s (code %d)", reason, code);
-	_fail(link, text);
 }
 
 static void _encode(const struct GBASIONetLinkMessage* message, uint8_t* buffer) {
@@ -620,6 +698,7 @@ static void _handleHello(struct GBASIONetLink* link, const struct GBASIONetLinkM
 	link->state = GBA_NETLINK_CONNECTED;
 	link->error[0] = '\0';
 	mLOG(GBA_SIO, INFO, "Network link established as player %i (partner game %s)", link->playerId + 1, link->peerGame);
+	GBASIONetLinkLog("handshake done: player %i, partner game %s", link->playerId + 1, link->peerGame);
 	_sendMode(link);
 	_updateSioBits(link);
 	_updateEngaged(link);
@@ -755,6 +834,11 @@ static void _handleRemoteTransfer(struct GBASIONetLink* link, const struct GBASI
 }
 
 static void _dispatch(struct GBASIONetLink* link, const struct GBASIONetLinkMessage* message) {
+	static unsigned logged = 0;
+	if (logged < 40 || message->type == MSG_MODE || message->type == MSG_BYE) {
+		++logged;
+		GBASIONetLinkLog("rx type=%u arg8=%u arg16=%u data=%08X", message->type, message->arg8, message->arg16, message->data);
+	}
 	switch (message->type) {
 	case MSG_HELLO:
 		_handleHello(link, message);
@@ -893,9 +977,17 @@ static void _service(struct GBASIONetLink* link, int timeoutMs) {
 	}
 }
 
+static bool _replyArrived(struct GBASIONetLink* link);
+
 static bool _waitFor(struct GBASIONetLink* link, bool (*done)(struct GBASIONetLink*)) {
 	int64_t start = _nowMicros();
 	int64_t lastCallback = start;
+	static unsigned waits = 0;
+	bool logThis = ++waits <= 30;
+	const char* what = done == _replyArrived ? "reply" : "drift";
+	if (logThis) {
+		GBASIONetLinkLog("wait #%u start (%s) quanta=%u/%u", waits, what, link->localQuanta, link->peerQuanta);
+	}
 	while (!done(link)) {
 		if (link->state != GBA_NETLINK_CONNECTED) {
 			return false;
@@ -919,7 +1011,11 @@ static bool _waitFor(struct GBASIONetLink* link, bool (*done)(struct GBASIONetLi
 		}
 		_pump(link, 20);
 	}
-	link->stats.waitMicros += _nowMicros() - start;
+	int64_t waited = _nowMicros() - start;
+	link->stats.waitMicros += waited;
+	if (logThis || waited > 100000) {
+		GBASIONetLinkLog("wait #%u (%s) done after %lld ms", waits, what, (long long) (waited / 1000));
+	}
 	return true;
 }
 
@@ -951,6 +1047,12 @@ static int32_t _nextInterval(struct GBASIONetLink* link) {
 static void _event(struct mTiming* timing, void* context, uint32_t cyclesLate) {
 	UNUSED(cyclesLate);
 	struct GBASIONetLink* link = context;
+	static unsigned count = 0;
+	++count;
+	if (count <= 40 || count % 5000 == 0) {
+		GBASIONetLinkLog("event #%u state=%i engaged=%i paused=%i/%i mode=%i/%i quanta=%u/%u", count, link->state, link->engaged,
+		                 link->localPaused, link->peerPaused, link->localMode, link->peerMode, link->localQuanta, link->peerQuanta);
+	}
 	int32_t now = mTimingCurrentTime(timing);
 	int32_t elapsed = now - link->lastEventTime;
 	link->lastEventTime = now;
@@ -1064,6 +1166,7 @@ void GBASIONetLinkSetPaused(struct GBASIONetLink* link, bool paused) {
 	if (link->localPaused == paused) {
 		return;
 	}
+	GBASIONetLinkLog("local %s", paused ? "paused" : "resumed");
 	if (paused) {
 		// Handle whatever already arrived while emulation can still act on it.
 		// A scheduled partner transfer stays scheduled; emulated time does not
@@ -1175,6 +1278,7 @@ bool GBASIONetLinkGetLocalAddress(char* out, size_t outLength) {
 
 static bool _driverInit(struct GBASIODriver* driver) {
 	struct GBASIONetLink* link = (struct GBASIONetLink*) driver;
+	GBASIONetLinkLog("driver attached, sio mode %i", driver->p->mode);
 	link->attached = true;
 	struct GBA* gba = driver->p->p;
 	if (gba->memory.rom) {
@@ -1196,6 +1300,7 @@ static bool _driverInit(struct GBASIODriver* driver) {
 
 static void _driverDeinit(struct GBASIODriver* driver) {
 	struct GBASIONetLink* link = (struct GBASIONetLink*) driver;
+	GBASIONetLinkLog("driver detached");
 	if (!link->attached) {
 		return;
 	}
@@ -1227,6 +1332,10 @@ static void _driverSetMode(struct GBASIODriver* driver, enum GBASIOMode mode) {
 	struct GBASIONetLink* link = (struct GBASIONetLink*) driver;
 	if (link->localMode == (int) mode) {
 		return;
+	}
+	static unsigned changes = 0;
+	if (++changes <= 100) {
+		GBASIONetLinkLog("sio mode %i -> %i", link->localMode, mode);
 	}
 	link->localMode = mode;
 	_sendMode(link);
